@@ -64,6 +64,77 @@ export interface AuditRecord {
   detail: string;
 }
 
+/** 检查点条目类型：冻结建账、步骤勾选、偏离、终态（完成/回滚）共用同一追加账本 */
+export type CheckpointKind = 'freeze' | 'step' | 'deviation' | 'terminal';
+export type TerminalResult = 'completed' | 'rolled_back';
+
+export interface CheckpointEntry {
+  /** 全局幂等键，同一上报只记一次 */
+  dedupeKey: string;
+  kind: CheckpointKind;
+  /** 检查点序号，按确认顺序单调递增，便于断点接续 */
+  seq: number;
+  recordedAt: string;
+  /** 步骤勾选：步骤 id + 是否完成 */
+  stepId?: string;
+  completed?: boolean;
+  /** 偏离：直接内联偏离内容，保证账本自包含、可重放 */
+  deviation?: DeviationRecord;
+  /** 终态提交 */
+  terminal?: TerminalResult;
+  note?: string;
+  actor: string;
+}
+
+/** 晚到提交与已落账终态冲突时的留痕 */
+export interface TerminalConflict {
+  dedupeKey: string;
+  /** 晚到的提交意图 */
+  attempted: TerminalResult;
+  /** 已先落账的终态 */
+  established: TerminalResult;
+  recordedAt: string;
+  note?: string;
+  actor: string;
+  reason: string;
+}
+
+/** 开始执行时冻结的方案、会签与回滚步骤 */
+export interface ExecutionFrozenPlan {
+  frozenAt: string;
+  steps: ChangeStep[];
+  approvals: ApprovalRecord[];
+  rollbackSteps: ChangeStep[];
+  /** 冻结时方案的步骤数量，用于提示执行期间方案发生过变化 */
+  planStepCount: number;
+}
+
+/** 写入中断后需要重做的检查点 */
+export interface RedoItem {
+  dedupeKey: string;
+  label: string;
+}
+
+/**
+ * 可接续检查点账本：执行期间只追加、不改写。
+ * 状态可由 frozenPlan + entries 完整重放恢复。
+ */
+export interface ExecutionLedger {
+  frozen: ExecutionFrozenPlan;
+  entries: CheckpointEntry[];
+  conflicts: TerminalConflict[];
+  /** 最后一次已确认持久化的检查点序号；写入中断后从这里接续 */
+  lastPersistedSeq: number;
+  /** 最近一次写入失败信息，恢复成功后清空 */
+  recovery?: {
+    restoredAt: string;
+    restoredSeq: number;
+    message: string;
+    /** 待重做的检查点列表 */
+    pendingRedo: RedoItem[];
+  };
+}
+
 export interface ChangeRequest {
   id: string;
   title: string;
@@ -78,6 +149,8 @@ export interface ChangeRequest {
   approvals: ApprovalRecord[];
   deviations: DeviationRecord[];
   audit: AuditRecord[];
+  /** 进入执行态后冻结的方案与只追加检查点账本 */
+  ledger?: ExecutionLedger;
   createdAt: string;
   updatedAt: string;
 }

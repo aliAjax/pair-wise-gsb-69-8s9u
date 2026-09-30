@@ -18,14 +18,21 @@ import {
   ApprovalStage,
   ChangeRequest,
   ChangeStep,
+  CheckpointEntry,
   DeviationRecord,
   PHASE_LABELS,
   RESOURCE_LABELS,
   RISK_LABELS,
   STAGE_LABELS,
   STATUS_LABELS,
+  TerminalResult,
   validateChange,
 } from '../../models/change-request.model';
+import {
+  buildDeviationDedupeKey,
+  buildStepDedupeKey,
+  buildTerminalDedupeKey,
+} from '../../models/execution-ledger';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import { selectAllChanges } from '../../store/change-request.selectors';
@@ -76,6 +83,33 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         </div>
       </section>
 
+      @if (recovery(); as recovery) {
+        <clr-alert clrAlertType="warning" [clrAlertClosable]="false">
+          <clr-alert-item>
+            <span class="alert-text">
+              <strong>检查点已恢复</strong>
+              {{ recovery.message }}
+              恢复时间 {{ recovery.restoredAt | date: 'yyyy-MM-dd HH:mm:ss' }}。
+              <span>待重做 {{ recovery.pendingRedo.length }} 项：</span>
+              @for (item of recovery.pendingRedo; track item.dedupeKey) {
+                <span class="redo-tag">{{ item.label }}</span>
+              }
+            </span>
+          </clr-alert-item>
+        </clr-alert>
+      }
+
+      @if (conflicts().length) {
+        <clr-alert clrAlertType="danger" [clrAlertClosable]="false">
+          <clr-alert-item>
+            <span class="alert-text">
+              <strong>存在 {{ conflicts().length }} 条终态冲突</strong>
+              回滚/完成终态已先落账，晚到的相反提交未覆盖当前状态，详情见执行记录页签。
+            </span>
+          </clr-alert-item>
+        </clr-alert>
+      }
+
       <nav class="tab-nav" aria-label="变更详情">
         @for (tab of tabs; track tab.id) {
           <button
@@ -104,9 +138,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="item.ledger !== undefined"
                 >
-                  {{ editing() ? '取消编辑' : '编辑方案' }}
+                  {{ item.ledger ? '方案已冻结' : editing() ? '取消编辑' : '编辑方案' }}
                 </button>
               </div>
 
@@ -257,15 +291,27 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
             <section class="surface">
               <div class="surface-heading">
                 <div>
-                  <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <h2>执行步骤（冻结版本）</h2>
+                  <span>
+                    开始执行时冻结方案步骤与回滚步骤；勾选按检查点追加，重复上报只记一次
+                    @if (item.ledger) {
+                      · 最后完整检查点 #{{ item.ledger.lastPersistedSeq }}
+                    }
+                  </span>
                 </div>
-                @if (item.status === 'approved') {
+                @if (item.status === 'approved' && !item.ledger) {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
                     开始执行
                   </button>
                 }
               </div>
+              @if (item.ledger) {
+                <p class="freeze-note">
+                  方案于 {{ item.ledger.frozen.frozenAt | date: 'yyyy-MM-dd HH:mm:ss' }} 冻结，
+                  共 {{ item.ledger.frozen.planStepCount }} 个步骤，其中回滚步骤
+                  {{ item.ledger.frozen.rollbackSteps.length }} 个，会签结论同步冻结。
+                </p>
+              }
               <div class="step-list">
                 @for (step of stepsBy(item); track step.id) {
                   <label class="step-row" [class.completed]="step.completed">
@@ -273,12 +319,15 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                       type="checkbox"
                       [checked]="step.completed"
                       [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
+                      (change)="toggleStep(step)"
                     />
                     <span class="phase">{{ phaseLabel(step.phase) }}</span>
                     <div>
                       <strong>{{ step.title }}</strong>
                       <code>{{ step.command || '未填写命令' }}</code>
+                      @if (step.completed && step.completedAt) {
+                        <small>完成于 {{ step.completedAt | date: 'MM-dd HH:mm:ss' }}</small>
+                      }
                     </div>
                     <span>{{ step.owner || '未指定' }}</span>
                   </label>
@@ -292,7 +341,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>实时执行记录</h2>
-                  <span>记录偏离并明确继续、暂停或回滚</span>
+                  <span>偏离与终态同样追加为检查点，写入中断自动恢复</span>
                 </div>
                 <a class="btn btn-sm" href="https://logs.example.internal/change/{{ item.id }}" target="_blank" rel="noopener">
                   打开实时日志
@@ -332,6 +381,17 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     执行完成
                   </button>
                 </div>
+              } @else if (terminalEntry(); as terminal) {
+                <div class="terminal-box" [class.rolled-back]="terminal.terminal === 'rolled_back'">
+                  <strong>
+                    终态检查点 #{{ terminal.seq }}：
+                    {{ terminal.terminal === 'completed' ? '执行完成' : '执行回滚' }}
+                  </strong>
+                  <p>{{ terminal.note }}</p>
+                  <small>
+                    {{ terminal.actor }} · {{ terminal.recordedAt | date: 'yyyy-MM-dd HH:mm:ss' }}
+                  </small>
+                </div>
               }
               <div class="deviation-list">
                 @for (deviation of item.deviations; track deviation.id) {
@@ -347,6 +407,80 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <p class="empty">尚无执行偏离。</p>
                 }
               </div>
+            </section>
+
+            @if (recovery(); as recovery) {
+              <section class="surface span-2 recovery-panel">
+                <div class="surface-heading">
+                  <div>
+                    <h2>待重做事项</h2>
+                    <span>{{ recovery.message }}</span>
+                  </div>
+                </div>
+                <ul class="redo-list">
+                  @for (redo of recovery.pendingRedo; track redo.dedupeKey) {
+                    <li>
+                      <span class="redo-tag">{{ redo.label }}</span>
+                    </li>
+                  }
+                </ul>
+                <p class="empty">
+                  请按上面的顺序在本页重新勾选/记录/判定；成功保存后待办自动消失。
+                </p>
+              </section>
+            }
+
+            @if (conflicts().length) {
+              <section class="surface span-2 conflict-panel">
+                <div class="surface-heading">
+                  <div>
+                    <h2>终态冲突（已保留先到终态）</h2>
+                    <span>回滚先到后，晚到的完成提交不改写状态，仅留痕说明</span>
+                  </div>
+                </div>
+                @for (conflict of conflicts(); track conflict.dedupeKey) {
+                  <article class="conflict-row">
+                    <div>
+                      <strong>
+                        晚到“{{ conflict.attempted === 'completed' ? '执行完成' : '执行回滚' }}”
+                        vs 已落账“{{ conflict.established === 'completed' ? '执行完成' : '执行回滚' }}”
+                      </strong>
+                      <p>{{ conflict.reason }}</p>
+                      <small>
+                        {{ conflict.actor }} · {{ conflict.recordedAt | date: 'yyyy-MM-dd HH:mm:ss' }}
+                        @if (conflict.note) {
+                          · {{ conflict.note }}
+                        }
+                      </small>
+                    </div>
+                  </article>
+                }
+              </section>
+            }
+
+            <section class="surface span-2">
+              <div class="surface-heading">
+                <div>
+                  <h2>检查点流水</h2>
+                  <span>步骤、偏离、终态同一账本按序追加，可凭此完整重放执行过程</span>
+                </div>
+              </div>
+              <ol class="checkpoint-ledger">
+                @for (entry of checkpointEntries(); track entry.dedupeKey) {
+                  <li>
+                    <span class="cp-seq">#{{ entry.seq }}</span>
+                    <div>
+                      <strong>{{ checkpointTitle(entry.kind) }}</strong>
+                      <p>{{ checkpointDetail(entry) }}</p>
+                      <small>
+                        {{ entry.actor }} · {{ entry.recordedAt | date: 'yyyy-MM-dd HH:mm:ss' }}
+                      </small>
+                    </div>
+                  </li>
+                } @empty {
+                  <li class="empty">尚无检查点。</li>
+                }
+              </ol>
             </section>
           </div>
         }
@@ -928,6 +1062,112 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #737373;
       }
 
+      .redo-tag {
+        display: inline-block;
+        margin: 2px 4px 2px 0;
+        padding: 2px 8px;
+        border: 1px solid #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+        font-size: 11px;
+      }
+
+      .freeze-note {
+        margin: 12px 0 4px;
+        padding: 10px 12px;
+        border-left: 3px solid #266c91;
+        background: #eaf4f9;
+        color: #1d5877;
+        font-size: 12px;
+      }
+
+      .step-row small {
+        margin-top: 4px;
+        color: #4b8d65;
+        font-size: 10px;
+      }
+
+      .terminal-box {
+        margin: 14px 0;
+        padding: 14px 16px;
+        border-left: 3px solid #4b8d65;
+        background: #edf7f0;
+        color: #245f3d;
+      }
+
+      .terminal-box.rolled-back {
+        border-left-color: #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .terminal-box p {
+        margin: 6px 0;
+      }
+
+      .terminal-box small {
+        color: inherit;
+        opacity: 0.8;
+      }
+
+      .recovery-panel .redo-list,
+      .checkpoint-ledger {
+        margin: 12px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .recovery-panel .redo-list li {
+        padding: 6px 0;
+      }
+
+      .conflict-panel .conflict-row {
+        margin-top: 12px;
+        padding: 12px 14px;
+        border-left: 3px solid #c21d00;
+        background: #fbece8;
+      }
+
+      .conflict-panel .conflict-row p {
+        margin: 6px 0;
+        color: #6a1d0c;
+      }
+
+      .conflict-panel .conflict-row small {
+        color: #8e260f;
+      }
+
+      .checkpoint-ledger li {
+        display: grid;
+        grid-template-columns: 44px 1fr;
+        gap: 12px;
+        padding: 10px 0;
+        border-bottom: 1px solid #e6e6e6;
+      }
+
+      .checkpoint-ledger li:last-child {
+        border-bottom: 0;
+      }
+
+      .checkpoint-ledger .cp-seq {
+        color: #266c91;
+        font-weight: 600;
+        font-size: 12px;
+      }
+
+      .checkpoint-ledger p {
+        margin: 4px 0;
+        color: #414141;
+      }
+
+      .checkpoint-ledger small {
+        color: #737373;
+      }
+
+      .checkpoint-ledger li.empty {
+        grid-template-columns: 1fr;
+      }
+
       .not-found {
         margin-top: 50px;
         padding: 48px;
@@ -1004,6 +1244,22 @@ export class ChangeDetailComponent {
 
   readonly hasBlockers = computed(() =>
     this.issues().some((issue) => issue.severity === 'blocker'),
+  );
+
+  readonly ledger = computed(() => this.change()?.ledger);
+
+  readonly recovery = computed(() => this.ledger()?.recovery);
+
+  readonly conflicts = computed(() => this.ledger()?.conflicts ?? []);
+
+  readonly checkpointEntries = computed(() =>
+    this.ledger()
+      ? [...this.ledger()!.entries].sort((a, b) => b.seq - a.seq)
+      : [],
+  );
+
+  readonly terminalEntry = computed(() =>
+    this.ledger()?.entries.find((entry) => entry.kind === 'terminal'),
   );
 
   readonly pendingStage = computed<ApprovalStage | null>(() => {
@@ -1101,11 +1357,22 @@ export class ChangeDetailComponent {
   }
 
   startExecution(): void {
-    this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
+    this.store.dispatch(
+      ChangeRequestActions.startExecution({ id: this.changeId, actor: this.currentActor() }),
+    );
   }
 
-  toggleStep(stepId: string): void {
-    this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+  toggleStep(step: ChangeStep): void {
+    const completed = !step.completed;
+    this.store.dispatch(
+      ChangeRequestActions.reportStepCheckpoint({
+        id: this.changeId,
+        stepId: step.id,
+        completed,
+        dedupeKey: buildStepDedupeKey(step.id, completed),
+        actor: this.currentActor(),
+      }),
+    );
   }
 
   recordDeviation(): void {
@@ -1113,23 +1380,70 @@ export class ChangeDetailComponent {
     if (!description) {
       return;
     }
+    const deviationId = `dev-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
+    const owner = this.currentActor();
     const deviation: DeviationRecord = {
-      id: `dev-${Date.now()}`,
+      id: deviationId,
       recordedAt: new Date().toISOString(),
-      owner: this.change()?.onCall[0] ?? '当前用户',
+      owner,
       description,
       decision: this.deviationDecision(),
     };
-    this.store.dispatch(ChangeRequestActions.recordDeviation({ id: this.changeId, deviation }));
+    this.store.dispatch(
+      ChangeRequestActions.recordDeviation({
+        id: this.changeId,
+        deviation,
+        dedupeKey: buildDeviationDedupeKey(deviationId),
+        actor: owner,
+      }),
+    );
     this.deviationText.set('');
   }
 
-  complete(result: 'completed' | 'rolled_back'): void {
+  complete(result: TerminalResult): void {
     const note =
       result === 'completed'
         ? '观察窗口内指标稳定，变更完成。'
-        : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+        : '发现不可接受影响，按冻结回滚步骤完成回滚。';
+    this.store.dispatch(
+      ChangeRequestActions.reportTerminal({
+        id: this.changeId,
+        result,
+        note,
+        actor: this.currentActor(),
+        dedupeKey: buildTerminalDedupeKey(result),
+      }),
+    );
+  }
+
+  checkpointTitle(kind: CheckpointEntry['kind']): string {
+    return {
+      freeze: '冻结建账',
+      step: '步骤勾选',
+      deviation: '执行偏离',
+      terminal: '终态判定',
+    }[kind];
+  }
+
+  checkpointDetail(entry: CheckpointEntry): string {
+    if (entry.kind === 'freeze') {
+      return '方案、会签结论与回滚步骤冻结，检查点账本建立';
+    }
+    if (entry.kind === 'step') {
+      const step = this.change()?.steps.find((item) => item.id === entry.stepId);
+      return `${step?.title ?? entry.stepId}：${entry.completed ? '勾选完成' : '取消完成'}`;
+    }
+    if (entry.kind === 'deviation' && entry.deviation) {
+      return `[${this.decisionLabel(entry.deviation.decision)}] ${entry.deviation.description}`;
+    }
+    if (entry.kind === 'terminal') {
+      return `${entry.terminal === 'completed' ? '执行完成' : '执行回滚'}${entry.note ? '：' + entry.note : ''}`;
+    }
+    return '';
+  }
+
+  private currentActor(): string {
+    return this.change()?.onCall[0] ?? '当前用户';
   }
 
   exportRetrospective(): void {

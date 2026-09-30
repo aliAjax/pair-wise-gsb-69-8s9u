@@ -15,9 +15,12 @@ import {
 } from '../../models/change-request.model';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import {
+  getConflictCount,
+  getRedoCount,
   selectAllChanges,
   selectChangesError,
   selectChangesLoading,
+  selectRecoverableChanges,
 } from '../../store/change-request.selectors';
 
 @Component({
@@ -53,10 +56,10 @@ import {
         <strong>{{ blockedCount() }}</strong>
         <small>依赖、冲突或回滚风险</small>
       </article>
-      <article>
-        <span>今日窗口</span>
-        <strong>{{ todayWindowCount() }}</strong>
-        <small>基于当前筛选数据</small>
+      <article [class.danger]="redoTotal() > 0">
+        <span>待重做检查点</span>
+        <strong>{{ redoTotal() }}</strong>
+        <small>写入中断已恢复，含冲突 {{ conflictTotal() }} 条</small>
       </article>
     </section>
 
@@ -66,6 +69,40 @@ import {
           <span class="alert-text">{{ error() }}</span>
         </clr-alert-item>
       </clr-alert>
+    }
+
+    @if (recoverableChanges().length) {
+      <section class="recovery-board">
+        <div class="recovery-head">
+          <div>
+            <h2>检查点恢复与终态冲突</h2>
+            <span>以下变更在上次写入中断后恢复到了最后完整检查点，或存在未消解的终态冲突</span>
+          </div>
+        </div>
+        <ul class="recovery-list">
+          @for (change of recoverableChanges(); track change.id) {
+            <li>
+              <a [routerLink]="['/changes', change.id]">
+                <span>{{ change.id }}</span>
+                <strong>{{ change.title }}</strong>
+              </a>
+              <div class="recovery-flags">
+                @if (redoCount(change.id); as redo) {
+                  <span class="flag redo">{{ redo }} 项待重做</span>
+                }
+                @if (conflictCount(change.id); as conflicts) {
+                  <span class="flag conflict">{{ conflicts }} 条终态冲突</span>
+                }
+              </div>
+              @if (change.ledger?.recovery; as recovery) {
+                <p class="recovery-msg">
+                  已恢复到检查点 #{{ recovery.restoredSeq }}：{{ recovery.message }}
+                </p>
+              }
+            </li>
+          }
+        </ul>
+      </section>
     }
 
     <section class="work-panel">
@@ -147,6 +184,12 @@ import {
                 </td>
                 <td>
                   <span class="status" [class]="change.status">{{ statusLabel(change.status) }}</span>
+                  @if (redoCount(change.id)) {
+                    <span class="row-flag redo">待重做 {{ redoCount(change.id) }}</span>
+                  }
+                  @if (conflictCount(change.id)) {
+                    <span class="row-flag conflict">冲突 {{ conflictCount(change.id) }}</span>
+                  }
                 </td>
                 <td>
                   <span class="risk" [class]="change.risk">{{ riskLabel(change.risk) }}</span>
@@ -391,6 +434,88 @@ import {
         color: #737373;
       }
 
+      .recovery-board {
+        margin-bottom: 24px;
+        padding: 16px 18px;
+        border: 1px solid #d0a251;
+        background: #fffaf0;
+      }
+
+      .recovery-head h2 {
+        margin: 0;
+        font-size: 15px;
+        color: #7c5000;
+      }
+
+      .recovery-head span {
+        color: #8a6a2a;
+        font-size: 12px;
+      }
+
+      .recovery-list {
+        margin: 12px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .recovery-list li {
+        display: grid;
+        grid-template-columns: minmax(220px, 1fr) auto;
+        gap: 8px 18px;
+        align-items: center;
+        padding: 10px 0;
+        border-bottom: 1px solid #efe0bf;
+      }
+
+      .recovery-list li:last-child {
+        border-bottom: 0;
+      }
+
+      .recovery-list a {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .recovery-list a span {
+        color: #266c91;
+        font-size: 11px;
+      }
+
+      .recovery-flags {
+        display: flex;
+        gap: 8px;
+      }
+
+      .flag,
+      .row-flag {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 2px 7px;
+        font-size: 11px;
+      }
+
+      .flag.redo,
+      .row-flag.redo {
+        border: 1px solid #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+      }
+
+      .flag.conflict,
+      .row-flag.conflict {
+        border: 1px solid #d58d7e;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .recovery-msg {
+        grid-column: 1 / -1;
+        margin: 0;
+        color: #8a6a2a;
+        font-size: 12px;
+      }
+
       @media (max-width: 980px) {
         .stats {
           grid-template-columns: repeat(2, 1fr);
@@ -464,6 +589,26 @@ export class DashboardComponent {
   readonly todayWindowCount = computed(() =>
     this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29')).length,
   );
+
+  readonly recoverableChanges = this.store.selectSignal(selectRecoverableChanges);
+
+  readonly redoTotal = computed(() =>
+    this.changes().reduce((sum, change) => sum + getRedoCount(change), 0),
+  );
+
+  readonly conflictTotal = computed(() =>
+    this.changes().reduce((sum, change) => sum + getConflictCount(change), 0),
+  );
+
+  redoCount(changeId: string): number {
+    const change = this.changes().find((item) => item.id === changeId);
+    return change ? getRedoCount(change) : 0;
+  }
+
+  conflictCount(changeId: string): number {
+    const change = this.changes().find((item) => item.id === changeId);
+    return change ? getConflictCount(change) : 0;
+  }
 
   reload(): void {
     this.store.dispatch(ChangeRequestActions.loadChanges());
