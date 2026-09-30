@@ -1,3 +1,5 @@
+import type { ExecutionLedger } from './execution-ledger.model';
+
 export type ChangeStatus =
   | 'draft'
   | 'submitted'
@@ -78,6 +80,8 @@ export interface ChangeRequest {
   approvals: ApprovalRecord[];
   deviations: DeviationRecord[];
   audit: AuditRecord[];
+  /** 执行检查点账本：开始执行后冻结方案，步骤/偏离/终态均按检查点追加 */
+  executionLedger?: ExecutionLedger;
   createdAt: string;
   updatedAt: string;
 }

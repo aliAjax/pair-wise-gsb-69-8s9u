@@ -26,6 +26,18 @@ import {
   STATUS_LABELS,
   validateChange,
 } from '../../models/change-request.model';
+import {
+  ExecutionEntry,
+  ExecutionFrozenPlan,
+  ExecutionRedoPayload,
+  ExecutionTerminalResult,
+  ExecutionView,
+  buildFrozenPlan,
+  createCheckpointToken,
+  entryStateLabel,
+  foldLedger,
+  terminalLabel,
+} from '../../models/execution-ledger.model';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import { selectAllChanges } from '../../store/change-request.selectors';
@@ -104,7 +116,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="!!item.executionLedger"
                 >
                   {{ editing() ? '取消编辑' : '编辑方案' }}
                 </button>
@@ -254,13 +266,90 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
 
         @case ('execution') {
           <div class="content-grid execution-grid">
+            @if (ledger(); as ledgerItem) {
+              <section class="surface span-2 freeze-banner">
+                <div>
+                  <h2>执行检查点账本</h2>
+                  <span>
+                    方案与会签已于
+                    {{ ledgerItem.frozenPlan.frozenAt | date: 'yyyy-MM-dd HH:mm' }}
+                    冻结，最后完整检查点
+                    #{{ ledgerItem.lastCommittedSeq }}（{{
+                      ledgerItem.lastCommittedAt
+                        ? (ledgerItem.lastCommittedAt | date: 'MM-dd HH:mm')
+                        : '尚无落盘确认'
+                    }}）
+                  </span>
+                </div>
+                <label class="fault-toggle" title="开启后下一次检查点保存将失败；刷新页面可复位">
+                  <input
+                    type="checkbox"
+                    [checked]="writeFaultEnabled()"
+                    (change)="toggleWriteFault()"
+                  />
+                  模拟下一次写入失败
+                </label>
+              </section>
+            }
+
+            @if (pendingRedoEntries().length) {
+              <section class="surface span-2 redo-panel">
+                <div class="surface-heading">
+                  <div>
+                    <h2>待重做项（{{ pendingRedoEntries().length }}）</h2>
+                    <span>写入中断后已恢复到最后完整检查点，以下上报需值班员确认重做</span>
+                  </div>
+                </div>
+                @for (entry of pendingRedoEntries(); track entry.token) {
+                  <div class="redo-row">
+                    <div>
+                      <strong>检查点 #{{ entry.seq }} · {{ entrySummary(entry) }}</strong>
+                      <small>{{ entry.occurredAt | date: 'MM-dd HH:mm:ss' }} · {{ entry.actor }}</small>
+                    </div>
+                    <div class="redo-actions">
+                      <button class="btn btn-sm" type="button" (click)="discardRedo(entry)">
+                        放弃
+                      </button>
+                      <button class="btn btn-sm btn-primary" type="button" (click)="retryRedo(entry)">
+                        重做此检查点
+                      </button>
+                    </div>
+                  </div>
+                }
+              </section>
+            }
+
+            @if (conflictEntries().length) {
+              <section class="surface span-2 conflict-panel">
+                <div class="surface-heading">
+                  <div>
+                    <h2>终态冲突留痕</h2>
+                    <span>后到的终态提交不覆盖先到结果，仅记录冲突原因备查</span>
+                  </div>
+                </div>
+                @for (entry of conflictEntries(); track entry.token) {
+                  <article class="conflict-row">
+                    <strong>{{ entry.result === 'completed' ? '晚到完成提交' : '晚到回滚提交' }}</strong>
+                    <p>{{ entry.conflictReason }}</p>
+                    <small>{{ entry.occurredAt | date: 'MM-dd HH:mm:ss' }} · {{ entry.actor }}</small>
+                  </article>
+                }
+              </section>
+            }
+
             <section class="surface">
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>
+                    @if (ledger()) {
+                      按冻结步骤逐项上报完成，勾选以最后完整检查点为准
+                    } @else {
+                      执行中可逐项勾选，所有操作保留时间戳
+                    }
+                  </span>
                 </div>
-                @if (item.status === 'approved') {
+                @if (item.status === 'approved' && !ledger()) {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
                     开始执行
                   </button>
@@ -268,19 +357,28 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               </div>
               <div class="step-list">
                 @for (step of stepsBy(item); track step.id) {
-                  <label class="step-row" [class.completed]="step.completed">
+                  <label
+                    class="step-row"
+                    [class.completed]="isStepCommitted(step.id)"
+                    [class.pending]="isStepPending(step.id)"
+                  >
                     <input
                       type="checkbox"
-                      [checked]="step.completed"
-                      [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
+                      [checked]="isStepCommitted(step.id)"
+                      [disabled]="!view().executing || isStepCommitted(step.id)"
+                      (change)="toggleStep(step)"
                     />
                     <span class="phase">{{ phaseLabel(step.phase) }}</span>
                     <div>
                       <strong>{{ step.title }}</strong>
                       <code>{{ step.command || '未填写命令' }}</code>
                     </div>
-                    <span>{{ step.owner || '未指定' }}</span>
+                    <span class="step-meta">
+                      {{ step.owner || '未指定' }}
+                      @if (isStepPending(step.id)) {
+                        <em class="state-pending">待落盘</em>
+                      }
+                    </span>
                   </label>
                 } @empty {
                   <p class="empty">没有执行步骤。</p>
@@ -298,7 +396,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   打开实时日志
                 </a>
               </div>
-              @if (item.status === 'executing') {
+              @if (view().executing) {
                 <div class="deviation-form">
                   <clr-textarea-container>
                     <label>偏离说明</label>
@@ -323,18 +421,33 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                         <option value="rollback">立即回滚</option>
                       </select>
                     </clr-select-container>
-                    <button class="btn" type="button" (click)="recordDeviation()">记录偏离</button>
+                    <button class="btn" type="button" (click)="recordDeviation()">
+                      记录偏离检查点
+                    </button>
                   </div>
                 </div>
                 <div class="completion-actions">
-                  <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
+                  <button class="btn" type="button" (click)="complete('rolled_back')">
+                    判定回滚
+                  </button>
                   <button class="btn btn-primary" type="button" (click)="complete('completed')">
                     执行完成
                   </button>
                 </div>
+              } @else if (view().terminal) {
+                <div class="terminal-strip" [class.rollback]="view().terminal === 'rolled_back'">
+                  终态已按检查点 #{{ ledger()?.lastCommittedSeq }} 落盘：{{
+                    view().terminal === 'rolled_back' ? '已回滚' : '已完成'
+                  }}
+                  @if (view().terminal === 'rolled_back') {
+                    <button class="btn btn-sm" type="button" (click)="reportLateComplete()">
+                      模拟晚到的完成提交
+                    </button>
+                  }
+                </div>
               }
               <div class="deviation-list">
-                @for (deviation of item.deviations; track deviation.id) {
+                @for (deviation of view().deviations; track deviation.id) {
                   <article>
                     <div>
                       <strong>{{ deviation.owner }}</strong>
@@ -344,10 +457,40 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     <span>{{ decisionLabel(deviation.decision) }}</span>
                   </article>
                 } @empty {
-                  <p class="empty">尚无执行偏离。</p>
+                  <p class="empty">
+                    {{ ledger() ? '已确认的偏离将在此显示。' : '尚无执行偏离。' }}
+                  </p>
                 }
               </div>
             </section>
+
+            @if (ledger()) {
+              <section class="surface span-2">
+                <div class="surface-heading">
+                  <div>
+                    <h2>检查点流水</h2>
+                    <span>同一检查点的开始、步骤、偏离与终态按序号追加，重复上报只记一次</span>
+                  </div>
+                </div>
+                <ol class="ledger-list">
+                  @for (entry of ledgerEntries(); track entry.token) {
+                    <li [class]="entry.state">
+                      <span class="ledger-seq">#{{ entry.seq }}</span>
+                      <div>
+                        <strong>{{ entrySummary(entry) }}</strong>
+                        <small
+                          >{{ entry.occurredAt | date: 'MM-dd HH:mm:ss' }} ·
+                          {{ entry.actor }}</small
+                        >
+                      </div>
+                      <span class="ledger-state" [class]="entry.state">
+                        {{ entryStateLabel(entry.state) }}
+                      </span>
+                    </li>
+                  }
+                </ol>
+              </section>
+            }
           </div>
         }
 
@@ -489,7 +632,21 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 </div>
                 <div>
                   <dt>完成步骤</dt>
-                  <dd>{{ completedSteps(item) }} / {{ item.steps.length }}</dd>
+                  <dd>{{ completedSteps(item) }} / {{ displaySteps().length }}</dd>
+                </div>
+                <div>
+                  <dt>最后检查点</dt>
+                  <dd>
+                    @if (ledger(); as ledgerItem) {
+                      #{{ ledgerItem.lastCommittedSeq
+                      }}<ng-container
+                        >（{{ ledgerItem.entries.filter((e) => e.state === 'needsRedo').length }}
+                        项待重做）</ng-container
+                      >
+                    } @else {
+                      未开始
+                    }
+                  </dd>
                 </div>
               </dl>
               <div class="retrospective-note">
@@ -928,6 +1085,193 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         color: #737373;
       }
 
+      .freeze-banner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        border-left: 4px solid #266c91;
+      }
+
+      .freeze-banner h2 {
+        margin: 0 0 4px;
+        font-size: 16px;
+      }
+
+      .fault-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+        color: #8e260f;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .redo-panel {
+        border-left: 4px solid #c21d00;
+      }
+
+      .redo-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 12px 2px;
+        border-bottom: 1px solid #f0d5cf;
+      }
+
+      .redo-row:last-child {
+        border-bottom: 0;
+      }
+
+      .redo-row strong {
+        display: block;
+        font-size: 13px;
+      }
+
+      .redo-row small {
+        color: #8e260f;
+      }
+
+      .redo-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .conflict-panel {
+        border-left: 4px solid #d58d7e;
+      }
+
+      .conflict-row {
+        padding: 12px;
+        background: #fbece8;
+      }
+
+      .conflict-row p {
+        margin: 6px 0;
+        color: #8e260f;
+      }
+
+      .conflict-row small {
+        color: #9b5a4d;
+      }
+
+      .step-row.pending {
+        outline: 1px dashed #d0a251;
+        background: #fff8ec;
+      }
+
+      .step-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        color: #575757;
+        font-size: 12px;
+      }
+
+      .state-pending {
+        color: #7c5000;
+        font-style: normal;
+        font-size: 11px;
+      }
+
+      .terminal-strip {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin: 14px 0;
+        padding: 12px 14px;
+        border-left: 3px solid #4b8d65;
+        background: #edf7f0;
+        color: #245f3d;
+        font-size: 13px;
+      }
+
+      .terminal-strip.rollback {
+        border-left-color: #d58d7e;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .ledger-list {
+        margin: 14px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .ledger-list li {
+        display: grid;
+        grid-template-columns: 48px 1fr auto;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 4px;
+        border-bottom: 1px solid #ececec;
+      }
+
+      .ledger-list li:last-child {
+        border-bottom: 0;
+      }
+
+      .ledger-list li.needsRedo,
+      .ledger-list li.conflict {
+        background: #fdf3f1;
+      }
+
+      .ledger-list li.pending {
+        background: #fff8ec;
+      }
+
+      .ledger-seq {
+        color: #266c91;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .ledger-list strong {
+        display: block;
+        font-size: 13px;
+      }
+
+      .ledger-list small {
+        color: #737373;
+      }
+
+      .ledger-state {
+        padding: 2px 8px;
+        font-size: 11px;
+        border: 1px solid #b9b9b9;
+        color: #555;
+        background: #f4f4f4;
+        white-space: nowrap;
+      }
+
+      .ledger-state.committed {
+        border-color: #8fb99f;
+        color: #286140;
+        background: #edf7f0;
+      }
+
+      .ledger-state.pending {
+        border-color: #d0a251;
+        color: #7c5000;
+        background: #fff7e6;
+      }
+
+      .ledger-state.needsRedo,
+      .ledger-state.conflict {
+        border-color: #d58d7e;
+        color: #8e260f;
+        background: #fbece8;
+      }
+
+      .ledger-state.duplicate {
+        border-color: #9aa9b5;
+        color: #425463;
+        background: #eef2f5;
+      }
+
       .not-found {
         margin-top: 50px;
         padding: 48px;
@@ -980,13 +1324,45 @@ export class ChangeDetailComponent {
 
   readonly changes = this.store.selectSignal(selectAllChanges);
   readonly change = computed(() => this.changes().find((item) => item.id === this.changeId));
-  readonly selectedTab = signal<DetailTab>('overview');
+  readonly selectedTab = signal<DetailTab>('execution');
   readonly editing = signal(false);
   readonly draft = signal<ChangeRequest | null>(null);
   readonly approver = signal('');
   readonly approvalComment = signal('');
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
+
+  /** 执行检查点账本：执行开始后以冻结快照为准 */
+  readonly ledger = computed(() => this.change()?.executionLedger);
+  readonly view = computed<ExecutionView>(() => foldLedger(this.ledger()));
+  /** 写入故障注入开关（演示写入中断与恢复） */
+  readonly writeFaultEnabled = this.service.writeFaultEnabled;
+
+  /** 执行态展示的步骤：有冻结快照时以冻结版本为准，防止方案被中途改写 */
+  readonly displaySteps = computed<ChangeStep[]>(() => {
+    const item = this.change();
+    if (!item) {
+      return [];
+    }
+    return this.ledger()?.frozenPlan.steps ?? item.steps;
+  });
+
+  readonly pendingRedoEntries = computed<ExecutionEntry[]>(
+    () => this.ledger()?.entries.filter((entry) => entry.state === 'needsRedo') ?? [],
+  );
+
+  readonly conflictEntries = computed<ExecutionEntry[]>(
+    () => this.ledger()?.entries.filter((entry) => entry.state === 'conflict') ?? [],
+  );
+
+  readonly ledgerEntries = computed<ExecutionEntry[]>(() => {
+    const entries = this.ledger()?.entries ?? [];
+    return [...entries].sort((left, right) =>
+      left.seq === right.seq
+        ? left.occurredAt.localeCompare(right.occurredAt)
+        : right.seq - left.seq,
+    );
+  });
 
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
@@ -1101,11 +1477,48 @@ export class ChangeDetailComponent {
   }
 
   startExecution(): void {
-    this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
+    const item = this.change();
+    if (!item || item.status !== 'approved') {
+      return;
+    }
+    const frozenPlan: ExecutionFrozenPlan = buildFrozenPlan(item);
+    this.store.dispatch(
+      ChangeRequestActions.startExecutionReport({
+        id: this.changeId,
+        token: createCheckpointToken(),
+        actor: item.owner || '当前用户',
+        frozenPlan,
+      }),
+    );
   }
 
-  toggleStep(stepId: string): void {
-    this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+  toggleStep(step: ChangeStep): void {
+    if (this.view().terminal) {
+      return;
+    }
+    // 以显式完成上报替代开关翻转：已确认的步骤不允许取消，重复上报只记一次
+    const alreadyCommitted = this.view().committedStepIds.has(step.id);
+    this.store.dispatch(
+      ChangeRequestActions.reportStep({
+        id: this.changeId,
+        token: createCheckpointToken(),
+        stepId: step.id,
+        stepTitle: step.title,
+        completed: !alreadyCommitted,
+        actor: this.currentActor(),
+      }),
+    );
+  }
+
+  isStepCommitted(stepId: string): boolean {
+    return this.view().committedStepIds.has(stepId);
+  }
+
+  isStepPending(stepId: string): boolean {
+    return this.ledger()?.entries.some(
+      (entry) =>
+        entry.type === 'step' && entry.stepId === stepId && entry.state === 'pending',
+    ) ?? false;
   }
 
   recordDeviation(): void {
@@ -1114,22 +1527,62 @@ export class ChangeDetailComponent {
       return;
     }
     const deviation: DeviationRecord = {
-      id: `dev-${Date.now()}`,
+      id: `dev-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
       recordedAt: new Date().toISOString(),
-      owner: this.change()?.onCall[0] ?? '当前用户',
+      owner: this.currentActor(),
       description,
       decision: this.deviationDecision(),
     };
-    this.store.dispatch(ChangeRequestActions.recordDeviation({ id: this.changeId, deviation }));
+    this.store.dispatch(
+      ChangeRequestActions.recordDeviationReport({
+        id: this.changeId,
+        token: createCheckpointToken(),
+        deviation,
+      }),
+    );
     this.deviationText.set('');
   }
 
-  complete(result: 'completed' | 'rolled_back'): void {
+  complete(result: ExecutionTerminalResult): void {
     const note =
       result === 'completed'
         ? '观察窗口内指标稳定，变更完成。'
         : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+    this.store.dispatch(
+      ChangeRequestActions.reportTerminal({
+        id: this.changeId,
+        token: createCheckpointToken(),
+        result,
+        note,
+        actor: this.currentActor(),
+      }),
+    );
+  }
+
+  /** 模拟晚到的完成提交：回滚先到后，完成提交留冲突且不覆盖 */
+  reportLateComplete(): void {
+    this.complete('completed');
+  }
+
+  retryRedo(entry: ExecutionEntry): void {
+    const payload: ExecutionRedoPayload = {
+      changeId: this.changeId,
+      entry,
+      ...(entry.type === 'start' ? { frozenPlan: this.ledger()?.frozenPlan } : {}),
+    };
+    this.store.dispatch(ChangeRequestActions.retryRedo({ payload }));
+  }
+
+  discardRedo(entry: ExecutionEntry): void {
+    this.store.dispatch(ChangeRequestActions.discardRedo({ token: entry.token }));
+  }
+
+  toggleWriteFault(): void {
+    this.service.toggleWriteFault(!this.writeFaultEnabled());
+  }
+
+  private currentActor(): string {
+    return this.change()?.onCall[0] ?? this.change()?.owner ?? '当前用户';
   }
 
   exportRetrospective(): void {
@@ -1150,14 +1603,37 @@ export class ChangeDetailComponent {
 
   stepsBy(change: ChangeRequest): ChangeStep[] {
     const order: ChangeStep['phase'][] = ['prepare', 'execute', 'verify', 'rollback'];
-    return [...change.steps].sort((left, right) => {
+    const source = change.executionLedger ? change.executionLedger.frozenPlan.steps : change.steps;
+    return [...source].sort((left, right) => {
       const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
       return phase || left.id.localeCompare(right.id);
     });
   }
 
   completedSteps(change: ChangeRequest): number {
+    if (change.executionLedger) {
+      return this.view().committedStepIds.size;
+    }
     return change.steps.filter((step) => step.completed).length;
+  }
+
+  entryStateLabel(state: ExecutionEntry['state']): string {
+    return entryStateLabel(state);
+  }
+
+  entrySummary(entry: ExecutionEntry): string {
+    switch (entry.type) {
+      case 'start':
+        return '开始执行：冻结方案、会签与回滚步骤';
+      case 'step':
+        return `步骤勾选：${entry.stepTitle ?? entry.stepId}`;
+      case 'deviation':
+        return `执行偏离：${entry.deviation?.description ?? ''}`;
+      case 'terminal':
+        return entry.conflictReason
+          ? `终态冲突：${entry.conflictReason}`
+          : `终态判定：${entry.result ? terminalLabel(entry.result) : ''}`;
+    }
   }
 
   statusLabel(status: ChangeRequest['status']): string {

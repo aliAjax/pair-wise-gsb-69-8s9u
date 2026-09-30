@@ -13,11 +13,13 @@ import {
   STATUS_LABELS,
   validateChange,
 } from '../../models/change-request.model';
+import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
 import {
   selectAllChanges,
   selectChangesError,
   selectChangesLoading,
+  selectPendingRedo,
 } from '../../store/change-request.selectors';
 
 @Component({
@@ -36,6 +38,69 @@ import {
         新建变更
       </a>
     </section>
+
+    <section class="checkpoint-bar" [class.fault]="writeFaultEnabled()">
+      <div>
+        <strong>检查点账本</strong>
+        <span
+          >待重做 {{ pendingRedo().length }} 项 · 终态冲突 {{ terminalConflicts().length }} 项 ·
+          所有执行上报按同一检查点幂等追加</span
+        >
+      </div>
+      <label class="fault-switch">
+        <input
+          type="checkbox"
+          [checked]="writeFaultEnabled()"
+          (change)="toggleWriteFault()"
+        />
+        模拟写入故障（下一次保存中断，验证可接续恢复）
+      </label>
+    </section>
+
+    @if (pendingRedo().length) {
+      <section class="redo-board">
+        <div class="board-heading">
+          <h2>待重做检查点</h2>
+          <span>写入中断后保留的最后完整检查点之后的未确认上报，需值班员逐项重做或放弃</span>
+        </div>
+        @for (item of pendingRedo(); track item.entry.token) {
+          <div class="board-row">
+            <a [routerLink]="['/changes', item.changeId]" class="board-link">
+              <strong>{{ item.changeId }} {{ item.changeTitle }}</strong>
+              <small>检查点 #{{ item.entry.seq }} · {{ item.entry.occurredAt | date: 'MM-dd HH:mm:ss' }}</small>
+            </a>
+            <span class="board-desc">{{ redoSummary(item.changeId) }} 等待重做</span>
+            <div class="board-actions">
+              <button class="btn btn-sm" type="button" (click)="discardRedo(item.entry.token)">
+                放弃
+              </button>
+              <button
+                class="btn btn-sm btn-primary"
+                type="button"
+                (click)="retryRedo(item.changeId, item.entry.token)"
+              >
+                重做
+              </button>
+            </div>
+          </div>
+        }
+      </section>
+    }
+
+    @if (terminalConflicts().length) {
+      <section class="conflict-board">
+        <div class="board-heading">
+          <h2>终态冲突</h2>
+          <span>回滚先到后晚到的完成提交已留冲突，先到终态不被覆盖</span>
+        </div>
+        @for (item of terminalConflicts(); track item.entry.token) {
+          <a [routerLink]="['/changes', item.change.id]" class="conflict-row">
+            <strong>{{ item.change.id }} {{ item.change.title }}</strong>
+            <span>{{ item.entry.conflictReason }}</span>
+          </a>
+        }
+      </section>
+    }
 
     <section class="stats" aria-label="变更统计">
       <article>
@@ -147,6 +212,15 @@ import {
                 </td>
                 <td>
                   <span class="status" [class]="change.status">{{ statusLabel(change.status) }}</span>
+                  @if (redoCountFor(change.id); as redoCount) {
+                    <a
+                      class="redo-badge"
+                      [routerLink]="['/changes', change.id]"
+                      [title]="redoSummary(change.id) + ' 待重做'"
+                    >
+                      待重做 {{ redoCount }}
+                    </a>
+                  }
                 </td>
                 <td>
                   <span class="risk" [class]="change.risk">{{ riskLabel(change.risk) }}</span>
@@ -391,6 +465,136 @@ import {
         color: #737373;
       }
 
+      .checkpoint-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 18px;
+        padding: 12px 16px;
+        border: 1px solid #bcd2de;
+        background: #eef6fa;
+      }
+
+      .checkpoint-bar.fault {
+        border-color: #d58d7e;
+        background: #fbece8;
+      }
+
+      .checkpoint-bar strong {
+        display: block;
+        font-size: 13px;
+        color: #1d5877;
+      }
+
+      .checkpoint-bar.fault strong {
+        color: #8e260f;
+      }
+
+      .checkpoint-bar span {
+        color: #5f5f5f;
+        font-size: 12px;
+      }
+
+      .fault-switch {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+        color: #555;
+        font-size: 12px;
+        cursor: pointer;
+      }
+
+      .checkpoint-bar.fault .fault-switch {
+        color: #8e260f;
+      }
+
+      .redo-board,
+      .conflict-board {
+        margin-bottom: 18px;
+        border: 1px solid #d58d7e;
+        background: #fff;
+      }
+
+      .conflict-board {
+        border-color: #e0b5ab;
+        background: #fdf6f4;
+      }
+
+      .board-heading {
+        padding: 14px 16px;
+        border-bottom: 1px solid #f0d5cf;
+      }
+
+      .board-heading h2 {
+        margin: 0 0 3px;
+        font-size: 15px;
+        color: #8e260f;
+      }
+
+      .board-heading span {
+        color: #8a6a62;
+        font-size: 12px;
+      }
+
+      .board-row {
+        display: grid;
+        grid-template-columns: minmax(220px, 1.4fr) 1fr auto;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 16px;
+        border-bottom: 1px solid #f5e4df;
+      }
+
+      .board-row:last-child {
+        border-bottom: 0;
+      }
+
+      .board-link {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .board-link small,
+      .board-desc {
+        color: #9b5a4d;
+        font-size: 12px;
+      }
+
+      .board-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .conflict-row {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 12px 16px;
+        border-bottom: 1px solid #f5e4df;
+      }
+
+      .conflict-row:last-child {
+        border-bottom: 0;
+      }
+
+      .conflict-row span {
+        color: #8e260f;
+        font-size: 12px;
+      }
+
+      .redo-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 2px 7px;
+        border: 1px solid #d58d7e;
+        background: #fbece8;
+        color: #8e260f;
+        font-size: 11px;
+      }
+
       @media (max-width: 980px) {
         .stats {
           grid-template-columns: repeat(2, 1fr);
@@ -417,10 +621,13 @@ import {
 })
 export class DashboardComponent {
   private readonly store = inject(Store);
+  private readonly service = inject(ChangeRequestService);
 
   readonly changes = this.store.selectSignal(selectAllChanges);
   readonly loading = this.store.selectSignal(selectChangesLoading);
   readonly error = this.store.selectSignal(selectChangesError);
+  readonly pendingRedo = this.store.selectSignal(selectPendingRedo);
+  readonly writeFaultEnabled = this.service.writeFaultEnabled;
 
   readonly query = signal('');
   readonly status = signal<ChangeStatus | 'all'>('all');
@@ -461,9 +668,64 @@ export class DashboardComponent {
       ).length,
   );
 
+  /** 所有变更中尚未消解的终态冲突留痕 */
+  readonly terminalConflicts = computed(() =>
+    this.changes().flatMap((change) =>
+      (change.executionLedger?.entries ?? [])
+        .filter((entry) => entry.state === 'conflict')
+        .map((entry) => ({ change, entry })),
+    ),
+  );
+
   readonly todayWindowCount = computed(() =>
     this.filteredChanges().filter((change) => change.window.start.startsWith('2026-09-29')).length,
   );
+
+  redoCountFor(changeId: string): number {
+    return this.pendingRedo().filter((item) => item.changeId === changeId).length;
+  }
+
+  redoSummary(changeId: string): string {
+    const items = this.pendingRedo().filter((item) => item.changeId === changeId);
+    return items
+      .map((item) =>
+        item.entry.type === 'start'
+          ? '开始执行'
+          : item.entry.type === 'step'
+            ? '步骤勾选'
+            : item.entry.type === 'deviation'
+              ? '偏离记录'
+              : '终态判定',
+      )
+      .join('、');
+  }
+
+  retryRedo(changeId: string, token: string): void {
+    const target = this.pendingRedo().find((item) => item.entry.token === token);
+    const change = this.changes().find((item) => item.id === changeId);
+    if (!target || !change) {
+      return;
+    }
+    this.store.dispatch(
+      ChangeRequestActions.retryRedo({
+        payload: {
+          changeId,
+          entry: target.entry,
+          ...(target.entry.type === 'start'
+            ? { frozenPlan: change.executionLedger?.frozenPlan }
+            : {}),
+        },
+      }),
+    );
+  }
+
+  discardRedo(token: string): void {
+    this.store.dispatch(ChangeRequestActions.discardRedo({ token }));
+  }
+
+  toggleWriteFault(): void {
+    this.service.toggleWriteFault(!this.writeFaultEnabled());
+  }
 
   reload(): void {
     this.store.dispatch(ChangeRequestActions.loadChanges());
